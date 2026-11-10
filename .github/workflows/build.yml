@@ -1,0 +1,1182 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.8
+      - name: Create files
+        run: |
+          mkdir -p src/main/java/com/example/aiplayer/client src/main/resources
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx1G
+          minecraft_version=1.21.1
+          yarn_mappings=1.21.1+build.3
+          loader_version=0.16.5
+          fabric_version=0.102.0+1.21.1
+          mod_version=1.2.0
+          maven_group=com.example
+          archives_base_name=aiplayer
+          EOF
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.7-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              mavenCentral()
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "aiplayer",
+            "version": "${version}",
+            "name": "AI Player",
+            "description": "An AI buddy that chats, builds and finds things.",
+            "authors": ["You"],
+            "environment": "*",
+            "entrypoints": {
+              "main": ["com.example.aiplayer.AiPlayerMod"],
+              "client": ["com.example.aiplayer.client.AiPlayerClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.1",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/java/com/example/aiplayer/AiConfig.java <<'EOF'
+          package com.example.aiplayer;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import java.io.IOException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          public class AiConfig {
+              private static final Gson G = new GsonBuilder().setPrettyPrinting().create();
+
+              public String apiUrl = "https://api.groq.com/openai/v1/chat/completions";
+              public String apiKey = "";
+              public String model = "openai/gpt-oss-20b";
+              public String name = "AI";
+              public boolean talk = true;
+              public String personality = "You are a friendly Minecraft player who plays together with the user. "
+                  + "Answer in 1 or 2 short sentences. Speak casually. "
+                  + "If the user writes in Tagalog, answer in Tagalog.";
+
+              static Path path() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("aiplayer.json");
+              }
+
+              public static AiConfig load() {
+                  try {
+                      Path p = path();
+                      if (Files.exists(p)) {
+                          AiConfig c = G.fromJson(Files.readString(p), AiConfig.class);
+                          if (c != null) return c;
+                      }
+                  } catch (Exception e) {
+                      // fall through to defaults
+                  }
+                  AiConfig c = new AiConfig();
+                  c.save();
+                  return c;
+              }
+
+              public void save() {
+                  try {
+                      Files.createDirectories(path().getParent());
+                      Files.writeString(path(), G.toJson(this));
+                  } catch (IOException e) {
+                      // ignore
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/aiplayer/Builds.java <<'EOF'
+          package com.example.aiplayer;
+
+          import java.util.ArrayList;
+          import java.util.Comparator;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+          import net.minecraft.block.Block;
+          import net.minecraft.block.BlockEntityProvider;
+          import net.minecraft.block.BlockState;
+          import net.minecraft.block.Blocks;
+          import net.minecraft.block.LadderBlock;
+          import net.minecraft.item.Item;
+          import net.minecraft.item.Items;
+          import net.minecraft.registry.Registries;
+          import net.minecraft.server.world.ServerWorld;
+          import net.minecraft.util.Identifier;
+          import net.minecraft.util.math.BlockPos;
+          import net.minecraft.util.math.Direction;
+
+          public class Builds {
+              public static class Step {
+                  public final BlockPos pos;
+                  public final BlockState state;
+                  public BlockState old;
+
+                  Step(BlockPos pos, BlockState state) {
+                      this.pos = pos;
+                      this.state = state;
+                  }
+              }
+
+              public static final ArrayList<Step> lastBuild = new ArrayList<>();
+              public static ServerWorld lastWorld;
+
+              public static int undoLast() {
+                  int n = 0;
+                  if (lastWorld != null) {
+                      for (int i = lastBuild.size() - 1; i >= 0; i--) {
+                          Step s = lastBuild.get(i);
+                          if (s.old != null) {
+                              lastWorld.setBlockState(s.pos, s.old);
+                              n++;
+                          }
+                      }
+                  }
+                  lastBuild.clear();
+                  return n;
+              }
+
+              public static void clear() {
+                  lastBuild.clear();
+                  lastWorld = null;
+              }
+
+              // ---------- names ----------
+              public static String shapeName(String s) {
+                  String x = s.toLowerCase(Locale.ROOT);
+                  switch (x) {
+                      case "house": case "home": case "hut": case "cabin": return "house";
+                      case "tower": case "castle": return "tower";
+                      case "wall": case "fence": return "wall";
+                      case "bridge": return "bridge";
+                      case "platform": case "floor": return "platform";
+                      case "pyramid": return "pyramid";
+                      default: return null;
+                  }
+              }
+
+              public static Block defaultMaterial(String shape) {
+                  switch (shape) {
+                      case "tower": return Blocks.STONE_BRICKS;
+                      case "wall": return Blocks.COBBLESTONE;
+                      case "platform": return Blocks.STONE;
+                      case "pyramid": return Blocks.SANDSTONE;
+                      default: return Blocks.OAK_PLANKS;
+                  }
+              }
+
+              // returns null when the block does not exist or is not allowed
+              public static Block material(String name, Block fallback) {
+                  if (name == null || name.isBlank()) return fallback;
+                  String n = name.toLowerCase(Locale.ROOT).trim().replace(' ', '_');
+                  if (!n.contains(":")) n = "minecraft:" + n;
+                  Identifier id = Identifier.tryParse(n);
+                  if (id == null || !Registries.BLOCK.containsId(id)) return null;
+                  Block b = Registries.BLOCK.get(id);
+                  if (b == Blocks.AIR || b == Blocks.TNT || b == Blocks.BEDROCK || b == Blocks.BARRIER
+                      || b == Blocks.FIRE || b instanceof BlockEntityProvider
+                      || !b.getDefaultState().getFluidState().isEmpty()) {
+                      return null;
+                  }
+                  return b;
+              }
+
+              // ---------- find ----------
+              public static void resolveFind(String name, Set<Block> blocks, Set<Item> items) {
+                  String n = name.toLowerCase(Locale.ROOT).trim().replace(' ', '_');
+                  if (n.startsWith("minecraft:")) n = n.substring(10);
+                  addFind(n, blocks, items);
+                  if (blocks.isEmpty() && items.isEmpty() && n.endsWith("s")) {
+                      addFind(n.substring(0, n.length() - 1), blocks, items);
+                  }
+                  blocks.remove(Blocks.AIR);
+                  blocks.remove(Blocks.CAVE_AIR);
+                  blocks.remove(Blocks.VOID_AIR);
+              }
+
+              private static void addFind(String n, Set<Block> blocks, Set<Item> items) {
+                  switch (n) {
+                      case "apple":
+                          items.add(Items.APPLE);
+                          blocks.add(Blocks.OAK_LEAVES);
+                          blocks.add(Blocks.DARK_OAK_LEAVES);
+                          return;
+                      case "tree": case "wood": case "log":
+                          blocks.add(Blocks.OAK_LOG);
+                          blocks.add(Blocks.BIRCH_LOG);
+                          blocks.add(Blocks.SPRUCE_LOG);
+                          blocks.add(Blocks.JUNGLE_LOG);
+                          blocks.add(Blocks.ACACIA_LOG);
+                          blocks.add(Blocks.DARK_OAK_LOG);
+                          return;
+                      default:
+                          break;
+                  }
+                  String[] cands = {n, n + "_ore", "deepslate_" + n + "_ore"};
+                  for (String c : cands) {
+                      Identifier id = Identifier.tryParse("minecraft:" + c);
+                      if (id == null) continue;
+                      if (Registries.BLOCK.containsId(id)) blocks.add(Registries.BLOCK.get(id));
+                      if (Registries.ITEM.containsId(id)) items.add(Registries.ITEM.get(id));
+                  }
+              }
+
+              // ---------- build shapes ----------
+              static int clamp(int v, int lo, int hi) {
+                  return Math.max(lo, Math.min(hi, v));
+              }
+
+              static int odd(int v) {
+                  return v % 2 == 0 ? v + 1 : v;
+              }
+
+              static void put(Map<BlockPos, BlockState> m, int x, int y, int z, BlockState s) {
+                  m.put(new BlockPos(x, y, z), s);
+              }
+
+              static void room(Map<BlockPos, BlockState> m, int cx, int oy, int cz, int half, int h,
+                               BlockState mat, int fx, int fz) {
+                  BlockState air = Blocks.AIR.getDefaultState();
+                  for (int x = -half; x <= half; x++) {
+                      for (int z = -half; z <= half; z++) {
+                          put(m, cx + x, oy - 1, cz + z, mat);
+                          put(m, cx + x, oy + h, cz + z, mat);
+                          boolean wall = Math.abs(x) == half || Math.abs(z) == half;
+                          for (int y = 0; y < h; y++) {
+                              put(m, cx + x, oy + y, cz + z, wall ? mat : air);
+                          }
+                      }
+                  }
+                  int dx = cx - fx * half;
+                  int dz = cz - fz * half;
+                  put(m, dx, oy, dz, air);
+                  put(m, dx, oy + 1, dz, air);
+              }
+
+              public static List<Step> generate(String shape, Block mat, int size, BlockPos o, int fx, int fz) {
+                  Direction dir = fx == 1 ? Direction.EAST
+                      : fx == -1 ? Direction.WEST
+                      : fz == 1 ? Direction.SOUTH : Direction.NORTH;
+                  int px = -fz;
+                  int pz = fx;
+                  int ox = o.getX();
+                  int oy = o.getY();
+                  int oz = o.getZ();
+                  Map<BlockPos, BlockState> m = new LinkedHashMap<>();
+                  BlockState ms = mat.getDefaultState();
+                  BlockState air = Blocks.AIR.getDefaultState();
+                  BlockState glass = Blocks.GLASS.getDefaultState();
+                  BlockState glow = Blocks.GLOWSTONE.getDefaultState();
+
+                  switch (shape) {
+                      case "house": {
+                          int half = odd(clamp(size <= 0 ? 7 : size, 5, 21)) / 2;
+                          int cx = ox + fx * (half + 3);
+                          int cz = oz + fz * (half + 3);
+                          room(m, cx, oy, cz, half, 4, ms, fx, fz);
+                          for (int y = 1; y <= 2; y++) {
+                              put(m, cx + px * half, oy + y, cz + pz * half, glass);
+                              put(m, cx - px * half, oy + y, cz - pz * half, glass);
+                          }
+                          put(m, cx, oy + 4, cz, glow);
+                          break;
+                      }
+                      case "tower": {
+                          int h = clamp(size <= 0 ? 12 : size, 6, 40);
+                          int half = 2;
+                          int cx = ox + fx * (half + 3);
+                          int cz = oz + fz * (half + 3);
+                          room(m, cx, oy, cz, half, h, ms, fx, fz);
+                          for (int y = 2; y < h - 1; y += 4) {
+                              put(m, cx + px * half, oy + y, cz + pz * half, glass);
+                              put(m, cx - px * half, oy + y, cz - pz * half, glass);
+                          }
+                          BlockState ladder = Blocks.LADDER.getDefaultState().with(LadderBlock.FACING, dir.getOpposite());
+                          int lx = cx + fx * (half - 1);
+                          int lz = cz + fz * (half - 1);
+                          for (int y = 0; y < h; y++) put(m, lx, oy + y, lz, ladder);
+                          put(m, lx, oy + h, lz, air);
+                          put(m, cx, oy - 1, cz, glow);
+                          break;
+                      }
+                      case "wall": {
+                          int len = clamp(size <= 0 ? 10 : size, 3, 40);
+                          int cx = ox + fx * 3;
+                          int cz = oz + fz * 3;
+                          for (int i = -len / 2; i <= len / 2; i++) {
+                              for (int y = 0; y < 4; y++) {
+                                  put(m, cx + px * i, oy + y, cz + pz * i, ms);
+                              }
+                          }
+                          break;
+                      }
+                      case "bridge": {
+                          int len = clamp(size <= 0 ? 12 : size, 3, 60);
+                          for (int i = 1; i <= len; i++) {
+                              for (int w = -1; w <= 1; w++) {
+                                  put(m, ox + fx * i + px * w, oy - 1, oz + fz * i + pz * w, ms);
+                              }
+                          }
+                          break;
+                      }
+                      case "platform": {
+                          int half = odd(clamp(size <= 0 ? 9 : size, 3, 25)) / 2;
+                          for (int x = -half; x <= half; x++) {
+                              for (int z = -half; z <= half; z++) {
+                                  put(m, ox + x, oy - 1, oz + z, ms);
+                              }
+                          }
+                          break;
+                      }
+                      case "pyramid": {
+                          int half = odd(clamp(size <= 0 ? 11 : size, 3, 25)) / 2;
+                          int cx = ox + fx * (half + 3);
+                          int cz = oz + fz * (half + 3);
+                          for (int i = 0; i <= half; i++) {
+                              int r = half - i;
+                              for (int x = -r; x <= r; x++) {
+                                  for (int z = -r; z <= r; z++) {
+                                      put(m, cx + x, oy + i, cz + z, ms);
+                                  }
+                              }
+                          }
+                          break;
+                      }
+                      default:
+                          break;
+                  }
+
+                  List<Step> out = new ArrayList<>();
+                  for (Map.Entry<BlockPos, BlockState> e : m.entrySet()) {
+                      out.add(new Step(e.getKey(), e.getValue()));
+                  }
+                  out.sort(Comparator.comparingInt((Step s) -> s.pos.getY()));
+                  if (out.size() > 4000) out = new ArrayList<>(out.subList(0, 4000));
+                  return out;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/aiplayer/AiBotEntity.java <<'EOF'
+          package com.example.aiplayer;
+
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+          import java.util.Comparator;
+          import java.util.EnumSet;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Set;
+          import net.minecraft.block.Block;
+          import net.minecraft.block.BlockState;
+          import net.minecraft.entity.EntityType;
+          import net.minecraft.entity.ItemEntity;
+          import net.minecraft.entity.ai.goal.Goal;
+          import net.minecraft.entity.ai.goal.LookAroundGoal;
+          import net.minecraft.entity.ai.goal.LookAtEntityGoal;
+          import net.minecraft.entity.ai.goal.SwimGoal;
+          import net.minecraft.entity.attribute.DefaultAttributeContainer;
+          import net.minecraft.entity.attribute.EntityAttributes;
+          import net.minecraft.entity.mob.PathAwareEntity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.item.Item;
+          import net.minecraft.particle.ParticleTypes;
+          import net.minecraft.server.world.ServerWorld;
+          import net.minecraft.sound.SoundCategory;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.math.BlockPos;
+          import net.minecraft.world.World;
+          import net.minecraft.world.chunk.Chunk;
+          import net.minecraft.world.chunk.ChunkStatus;
+
+          public class AiBotEntity extends PathAwareEntity {
+              private static final int NONE = 0;
+              private static final int BUILD = 1;
+              private static final int FIND = 2;
+
+              private int job = NONE;
+              private int jobTicks = 0;
+              private final ArrayDeque<Builds.Step> steps = new ArrayDeque<>();
+              private int placed = 0;
+              private final ArrayDeque<int[]> chunkQueue = new ArrayDeque<>();
+              private final Set<Block> findBlocks = new HashSet<>();
+              private final Set<Item> findItems = new HashSet<>();
+              private String findLabel = "";
+              private BlockPos found = null;
+              private boolean arrived = false;
+
+              public AiBotEntity(EntityType<? extends PathAwareEntity> type, World world) {
+                  super(type, world);
+                  setInvulnerable(true);
+                  setPersistent();
+              }
+
+              public static DefaultAttributeContainer.Builder createAttributes() {
+                  return PathAwareEntity.createMobAttributes()
+                      .add(EntityAttributes.GENERIC_MAX_HEALTH, 20.0)
+                      .add(EntityAttributes.GENERIC_MOVEMENT_SPEED, 0.3)
+                      .add(EntityAttributes.GENERIC_FOLLOW_RANGE, 48.0);
+              }
+
+              @Override
+              protected void initGoals() {
+                  goalSelector.add(0, new SwimGoal(this));
+                  goalSelector.add(1, new FollowPlayerGoal(this));
+                  goalSelector.add(2, new LookAtEntityGoal(this, PlayerEntity.class, 8.0f));
+                  goalSelector.add(3, new LookAroundGoal(this));
+              }
+
+              public boolean isFinding() {
+                  return job == FIND;
+              }
+
+              public boolean isBuilding() {
+                  return job == BUILD;
+              }
+
+              public void stopJob() {
+                  job = NONE;
+                  steps.clear();
+                  chunkQueue.clear();
+                  found = null;
+                  arrived = false;
+                  getNavigation().stop();
+              }
+
+              private void say(ServerWorld w, String text) {
+                  if (w.getServer() != null) AiPlayerMod.say(w.getServer(), text);
+              }
+
+              // ---------- building ----------
+              public void startBuild(List<Builds.Step> list) {
+                  stopJob();
+                  steps.addAll(list);
+                  placed = 0;
+                  jobTicks = 0;
+                  Builds.lastBuild.clear();
+                  if (getWorld() instanceof ServerWorld w) Builds.lastWorld = w;
+                  job = BUILD;
+              }
+
+              private void buildTick(ServerWorld w) {
+                  if (steps.isEmpty()) {
+                      job = NONE;
+                      say(w, "Done! " + placed + " blocks placed. Type /ai undo if you want it gone.");
+                      return;
+                  }
+                  BlockPos last = null;
+                  for (int i = 0; i < 4 && !steps.isEmpty(); i++) {
+                      Builds.Step s = steps.pollFirst();
+                      BlockState cur = w.getBlockState(s.pos);
+                      if (cur == s.state) continue;
+                      if (w.getBlockEntity(s.pos) != null || cur.getHardness(w, s.pos) < 0) continue;
+                      s.old = cur;
+                      Builds.lastBuild.add(s);
+                      w.setBlockState(s.pos, s.state);
+                      placed++;
+                      last = s.pos;
+                  }
+                  if (last != null && jobTicks % 3 == 0) {
+                      swingHand(Hand.MAIN_HAND);
+                      w.playSound(null, last, w.getBlockState(last).getSoundGroup().getPlaceSound(),
+                          SoundCategory.BLOCKS, 0.8f, 1.0f);
+                  }
+              }
+
+              // ---------- finding ----------
+              public boolean startFind(String name) {
+                  stopJob();
+                  findBlocks.clear();
+                  findItems.clear();
+                  Builds.resolveFind(name, findBlocks, findItems);
+                  if (findBlocks.isEmpty() && findItems.isEmpty()) return false;
+                  if (!(getWorld() instanceof ServerWorld w)) return false;
+                  findLabel = name.replace('_', ' ');
+                  found = null;
+                  arrived = false;
+                  jobTicks = 0;
+                  job = FIND;
+
+                  if (!findItems.isEmpty()) {
+                      List<ItemEntity> items = w.getEntitiesByClass(ItemEntity.class,
+                          getBoundingBox().expand(64), e -> findItems.contains(e.getStack().getItem()));
+                      ItemEntity best = null;
+                      double bd = 1e18;
+                      for (ItemEntity e : items) {
+                          double d = squaredDistanceTo(e);
+                          if (d < bd) {
+                              bd = d;
+                              best = e;
+                          }
+                      }
+                      if (best != null) {
+                          foundAt(w, best.getBlockPos());
+                          return true;
+                      }
+                  }
+
+                  final int bx = getBlockPos().getX() >> 4;
+                  final int bz = getBlockPos().getZ() >> 4;
+                  List<int[]> list = new ArrayList<>();
+                  for (int dx = -6; dx <= 6; dx++) {
+                      for (int dz = -6; dz <= 6; dz++) {
+                          list.add(new int[]{bx + dx, bz + dz});
+                      }
+                  }
+                  list.sort(Comparator.comparingInt((int[] a) -> (a[0] - bx) * (a[0] - bx) + (a[1] - bz) * (a[1] - bz)));
+                  chunkQueue.addAll(list);
+                  return true;
+              }
+
+              private void foundAt(ServerWorld w, BlockPos pos) {
+                  found = pos;
+                  chunkQueue.clear();
+                  int dist = (int) Math.sqrt(squaredDistanceTo(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5));
+                  say(w, "Found " + findLabel + " at " + pos.getX() + " " + pos.getY() + " " + pos.getZ()
+                      + " (" + dist + " blocks away). Follow the green sparkles!");
+              }
+
+              private BlockPos scan(ServerWorld w, int cx, int cz) {
+                  Chunk ch = w.getChunk(cx, cz, ChunkStatus.FULL, false);
+                  if (ch == null) return null;
+                  BlockPos.Mutable mp = new BlockPos.Mutable();
+                  BlockPos best = null;
+                  double bd = 1e18;
+                  for (int y = w.getBottomY(); y < w.getTopY(); y++) {
+                      for (int x = 0; x < 16; x++) {
+                          for (int z = 0; z < 16; z++) {
+                              mp.set(cx * 16 + x, y, cz * 16 + z);
+                              if (findBlocks.contains(ch.getBlockState(mp).getBlock())) {
+                                  double dx = mp.getX() + 0.5 - getX();
+                                  double dy = mp.getY() + 0.5 - getY();
+                                  double dz = mp.getZ() + 0.5 - getZ();
+                                  double d = dx * dx + dy * dy + dz * dz;
+                                  if (d < bd) {
+                                      bd = d;
+                                      best = mp.toImmutable();
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  return best;
+              }
+
+              private void findTick(ServerWorld w) {
+                  if (found == null) {
+                      for (int n = 0; n < 2; n++) {
+                          int[] c = chunkQueue.pollFirst();
+                          if (c == null) {
+                              say(w, "I can't see any " + findLabel + " nearby. I only search loaded chunks around me. Try another place.");
+                              stopJob();
+                              return;
+                          }
+                          BlockPos hit = scan(w, c[0], c[1]);
+                          if (hit != null) {
+                              foundAt(w, hit);
+                              break;
+                          }
+                      }
+                      return;
+                  }
+                  double fx = found.getX() + 0.5;
+                  double fy = found.getY() + 0.5;
+                  double fz = found.getZ() + 0.5;
+                  if (jobTicks % 10 == 0) {
+                      w.spawnParticles(ParticleTypes.HAPPY_VILLAGER, fx, fy, fz, 10, 0.4, 0.4, 0.4, 0.0);
+                  }
+                  if (squaredDistanceTo(fx, fy, fz) < 16.0) {
+                      if (!arrived) {
+                          arrived = true;
+                          getNavigation().stop();
+                          say(w, "I'm here!");
+                      }
+                  } else if (jobTicks % 20 == 0) {
+                      getNavigation().startMovingTo(fx, found.getY(), fz, 1.2);
+                  }
+                  if (jobTicks > 1500) stopJob();
+              }
+
+              @Override
+              public void tick() {
+                  super.tick();
+                  if (job == NONE) return;
+                  if (!(getWorld() instanceof ServerWorld w)) return;
+                  jobTicks++;
+                  if (job == BUILD) buildTick(w);
+                  else if (job == FIND) findTick(w);
+              }
+
+              static class FollowPlayerGoal extends Goal {
+                  private final AiBotEntity bot;
+                  private PlayerEntity target;
+                  private int cooldown;
+
+                  FollowPlayerGoal(AiBotEntity bot) {
+                      this.bot = bot;
+                      setControls(EnumSet.of(Goal.Control.MOVE, Goal.Control.LOOK));
+                  }
+
+                  @Override
+                  public boolean canStart() {
+                      if (bot.isFinding()) return false;
+                      target = bot.getWorld().getClosestPlayer(bot, 48.0);
+                      return target != null && !target.isSpectator() && bot.squaredDistanceTo(target) > 16.0;
+                  }
+
+                  @Override
+                  public boolean shouldContinue() {
+                      return !bot.isFinding() && target != null && target.isAlive() && bot.squaredDistanceTo(target) > 6.0;
+                  }
+
+                  @Override
+                  public void start() {
+                      cooldown = 0;
+                  }
+
+                  @Override
+                  public void stop() {
+                      target = null;
+                      bot.getNavigation().stop();
+                  }
+
+                  @Override
+                  public void tick() {
+                      if (target == null) return;
+                      bot.getLookControl().lookAt(target, 10.0f, (float) bot.getMaxLookPitchChange());
+                      cooldown--;
+                      if (cooldown > 0) return;
+                      cooldown = 10;
+                      if (bot.squaredDistanceTo(target) > 24.0 * 24.0) {
+                          bot.refreshPositionAndAngles(target.getX() + 1.0, target.getY(), target.getZ() + 1.0,
+                              bot.getYaw(), bot.getPitch());
+                          bot.getNavigation().stop();
+                      } else {
+                          bot.getNavigation().startMovingTo(target, 1.2);
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/aiplayer/client/AiBotRenderer.java <<'EOF'
+          package com.example.aiplayer.client;
+
+          import com.example.aiplayer.AiBotEntity;
+          import net.minecraft.client.render.entity.BipedEntityRenderer;
+          import net.minecraft.client.render.entity.EntityRendererFactory;
+          import net.minecraft.client.render.entity.model.EntityModelLayers;
+          import net.minecraft.client.render.entity.model.PlayerEntityModel;
+          import net.minecraft.util.Identifier;
+
+          public class AiBotRenderer extends BipedEntityRenderer<AiBotEntity, PlayerEntityModel<AiBotEntity>> {
+              private static final Identifier SKIN = Identifier.of("minecraft", "textures/entity/player/wide/steve.png");
+
+              public AiBotRenderer(EntityRendererFactory.Context ctx) {
+                  super(ctx, new PlayerEntityModel<AiBotEntity>(ctx.getPart(EntityModelLayers.PLAYER), false), 0.5f);
+              }
+
+              @Override
+              public Identifier getTexture(AiBotEntity entity) {
+                  return SKIN;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/aiplayer/client/AiPlayerClient.java <<'EOF'
+          package com.example.aiplayer.client;
+
+          import com.example.aiplayer.AiPlayerMod;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.rendering.v1.EntityRendererRegistry;
+
+          public class AiPlayerClient implements ClientModInitializer {
+              @Override
+              public void onInitializeClient() {
+                  EntityRendererRegistry.register(AiPlayerMod.BOT, AiBotRenderer::new);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/aiplayer/AiPlayerMod.java <<'EOF'
+          package com.example.aiplayer;
+
+          import com.google.gson.JsonArray;
+          import com.google.gson.JsonObject;
+          import com.google.gson.JsonParser;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+          import java.net.URI;
+          import java.net.http.HttpClient;
+          import java.net.http.HttpRequest;
+          import java.net.http.HttpResponse;
+          import java.time.Duration;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.concurrent.ConcurrentHashMap;
+          import java.util.function.Consumer;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+          import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
+          import net.fabricmc.fabric.api.object.builder.v1.entity.FabricDefaultAttributeRegistry;
+          import net.minecraft.block.Block;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.EntityType;
+          import net.minecraft.entity.SpawnGroup;
+          import net.minecraft.registry.Registries;
+          import net.minecraft.registry.Registry;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.command.CommandManager;
+          import net.minecraft.server.command.ServerCommandSource;
+          import net.minecraft.server.network.ServerPlayerEntity;
+          import net.minecraft.server.world.ServerWorld;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Identifier;
+          import net.minecraft.util.math.Direction;
+
+          public class AiPlayerMod implements ModInitializer {
+              public static final EntityType<AiBotEntity> BOT = Registry.register(
+                  Registries.ENTITY_TYPE,
+                  Identifier.of("aiplayer", "ai_bot"),
+                  EntityType.Builder.create(AiBotEntity::new, SpawnGroup.MISC)
+                      .dimensions(0.6f, 1.8f)
+                      .maxTrackingRange(10)
+                      .build("ai_bot"));
+
+              static final String ACTIONS = " ACTIONS: you control a real body in the world. When the player asks you to do something, "
+                  + "write a short reply and put exactly ONE action tag at the very end of your message. Tags: "
+                  + "[BUILD shape material size] - shapes: house, tower, wall, bridge, platform, pyramid. "
+                  + "material is a Minecraft block id like oak_planks, stone_bricks, cobblestone, glass, sandstone (optional). "
+                  + "size is a number (optional): house width (default 7), tower height, wall or bridge length, platform or pyramid width. "
+                  + "Example: [BUILD house stone_bricks 9]. "
+                  + "[FIND thing] - thing is a Minecraft block id with underscores like diamond_ore, iron_ore, oak_log, chest, or the word apple. "
+                  + "Example: [FIND diamond_ore]. "
+                  + "[COME] - go to the player. [STOP] - stop what you are doing. [UNDO] - remove your last build. "
+                  + "Only use a tag when the player really asks for that action. Never explain the tags. "
+                  + "If asked to build something that is not one of the shapes, say you can only build those shapes.";
+              static final Pattern TAG = Pattern.compile("\\[\\s*(BUILD|FIND|COME|STOP|UNDO)\\b([^\\]]*)\\]", Pattern.CASE_INSENSITIVE);
+
+              static AiConfig config;
+              static UUID botId;
+              static final HttpClient HTTP = HttpClient.newHttpClient();
+              static final Map<UUID, ArrayList<String[]>> history = new HashMap<>();
+              static final Set<UUID> busy = ConcurrentHashMap.newKeySet();
+
+              @Override
+              public void onInitialize() {
+                  config = AiConfig.load();
+                  FabricDefaultAttributeRegistry.register(BOT, AiBotEntity.createAttributes());
+
+                  ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
+                      Builds.clear();
+                      botId = null;
+                  });
+
+                  CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+                      dispatcher.register(CommandManager.literal("ai")
+                          .then(setter("key", v -> config.apiKey = v))
+                          .then(setter("model", v -> config.model = v))
+                          .then(setter("url", v -> config.apiUrl = v))
+                          .then(setter("name", v -> config.name = v))
+                          .then(setter("personality", v -> config.personality = v))
+                          .then(CommandManager.literal("talk")
+                              .requires(s -> s.hasPermissionLevel(2))
+                              .then(CommandManager.literal("on").executes(ctx -> {
+                                  config.talk = true;
+                                  config.save();
+                                  ctx.getSource().sendFeedback(() -> Text.literal("AI now answers every chat message"), false);
+                                  return 1;
+                              }))
+                              .then(CommandManager.literal("off").executes(ctx -> {
+                                  config.talk = false;
+                                  config.save();
+                                  ctx.getSource().sendFeedback(() -> Text.literal("AI now only answers /ai messages"), false);
+                                  return 1;
+                              })))
+                          .then(CommandManager.literal("spawn").executes(ctx -> {
+                              ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                              ServerWorld w = p.getServerWorld();
+                              removeBots(ctx.getSource().getServer(), w, p);
+                              AiBotEntity bot = BOT.create(w);
+                              if (bot == null) return 0;
+                              bot.refreshPositionAndAngles(p.getX() + 1.5, p.getY(), p.getZ() + 1.5, p.getYaw() + 180.0f, 0.0f);
+                              bot.setCustomName(Text.literal(config.name));
+                              bot.setCustomNameVisible(true);
+                              bot.setPersistent();
+                              w.spawnEntity(bot);
+                              botId = bot.getUuid();
+                              ctx.getSource().sendFeedback(() -> Text.literal(config.name + " joined. Just chat with it."), false);
+                              return 1;
+                          }))
+                          .then(CommandManager.literal("remove").executes(ctx -> {
+                              ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                              removeBots(ctx.getSource().getServer(), p.getServerWorld(), p);
+                              ctx.getSource().sendFeedback(() -> Text.literal("AI body removed"), false);
+                              return 1;
+                          }))
+                          .then(CommandManager.literal("stop").executes(ctx -> {
+                              ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                              AiBotEntity b = findBot(p);
+                              if (b != null) b.stopJob();
+                              ctx.getSource().sendFeedback(() -> Text.literal("Stopped"), false);
+                              return 1;
+                          }))
+                          .then(CommandManager.literal("undo").executes(ctx -> {
+                              ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                              AiBotEntity b = findBot(p);
+                              if (b != null) b.stopJob();
+                              int n = Builds.undoLast();
+                              ctx.getSource().sendFeedback(() -> Text.literal("Restored " + n + " blocks"), false);
+                              return 1;
+                          }))
+                          .then(CommandManager.literal("clear").executes(ctx -> {
+                              ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                              history.remove(p.getUuid());
+                              ctx.getSource().sendFeedback(() -> Text.literal("AI memory cleared"), false);
+                              return 1;
+                          }))
+                          .then(CommandManager.literal("status").executes(ctx -> {
+                              String s = "Name: " + config.name + " | Model: " + config.model
+                                  + " | Key: " + (config.apiKey.isBlank() ? "NOT SET" : "set")
+                                  + " | Talk: " + (config.talk ? "every message" : "/ai only")
+                                  + " | URL: " + config.apiUrl;
+                              ctx.getSource().sendFeedback(() -> Text.literal(s), false);
+                              return 1;
+                          }))
+                          .then(CommandManager.argument("message", StringArgumentType.greedyString()).executes(ctx -> {
+                              ServerPlayerEntity p = ctx.getSource().getPlayerOrThrow();
+                              String m = StringArgumentType.getString(ctx, "message").trim();
+                              MinecraftServer server = p.getServer();
+                              if (server != null) {
+                                  server.getPlayerManager().broadcast(
+                                      Text.literal("<" + p.getName().getString() + "> " + m), false);
+                              }
+                              ask(p, m);
+                              return 1;
+                          })));
+                  });
+
+                  ServerMessageEvents.CHAT_MESSAGE.register((message, sender, params) -> {
+                      if (!config.talk) return;
+                      String t = message.getContent().getString().trim();
+                      if (t.isEmpty()) return;
+                      ask(sender, t);
+                  });
+              }
+
+              // ---------- bot helpers ----------
+              static void removeBots(MinecraftServer server, ServerWorld here, ServerPlayerEntity p) {
+                  if (botId != null) {
+                      for (ServerWorld w : server.getWorlds()) {
+                          Entity e = w.getEntity(botId);
+                          if (e != null) e.discard();
+                      }
+                  }
+                  for (AiBotEntity b : here.getEntitiesByClass(AiBotEntity.class, p.getBoundingBox().expand(200), e -> true)) {
+                      b.discard();
+                  }
+                  botId = null;
+              }
+
+              static AiBotEntity findBot(ServerPlayerEntity p) {
+                  MinecraftServer server = p.getServer();
+                  if (server != null && botId != null) {
+                      for (ServerWorld w : server.getWorlds()) {
+                          Entity e = w.getEntity(botId);
+                          if (e instanceof AiBotEntity b) return b;
+                      }
+                  }
+                  List<AiBotEntity> near = p.getServerWorld().getEntitiesByClass(
+                      AiBotEntity.class, p.getBoundingBox().expand(200), e -> true);
+                  if (!near.isEmpty()) {
+                      botId = near.get(0).getUuid();
+                      return near.get(0);
+                  }
+                  return null;
+              }
+
+              static void callBot(AiBotEntity bot, ServerPlayerEntity p) {
+                  if (bot.getWorld() == p.getServerWorld() && bot.squaredDistanceTo(p) > 400.0) {
+                      bot.refreshPositionAndAngles(p.getX() + 1.0, p.getY(), p.getZ() + 1.0, bot.getYaw(), bot.getPitch());
+                      bot.getNavigation().stop();
+                  }
+              }
+
+              static LiteralArgumentBuilder<ServerCommandSource> setter(String lit, Consumer<String> f) {
+                  return CommandManager.literal(lit)
+                      .requires(s -> s.hasPermissionLevel(2))
+                      .then(CommandManager.argument("value", StringArgumentType.greedyString()).executes(ctx -> {
+                          f.accept(StringArgumentType.getString(ctx, "value").trim());
+                          config.save();
+                          ctx.getSource().sendFeedback(() -> Text.literal("Saved: " + lit), false);
+                          return 1;
+                      }));
+              }
+
+              static void say(MinecraftServer server, String text) {
+                  String t = text.length() > 600 ? text.substring(0, 600) : text;
+                  for (String line : t.split("\n")) {
+                      if (line.isBlank()) continue;
+                      server.getPlayerManager().broadcast(Text.literal("<" + config.name + "> " + line.trim()), false);
+                  }
+              }
+
+              // ---------- actions ----------
+              static String clean(String raw) {
+                  return TAG.matcher(raw).replaceAll("").trim();
+              }
+
+              static void act(ServerPlayerEntity p, MinecraftServer server, String raw) {
+                  Matcher m = TAG.matcher(raw);
+                  if (!m.find()) return;
+                  String cmd = m.group(1).toUpperCase(Locale.ROOT);
+                  String args = m.group(2).trim();
+                  AiBotEntity bot = findBot(p);
+
+                  if (cmd.equals("UNDO")) {
+                      if (bot != null) bot.stopJob();
+                      say(server, "Removed my last build (" + Builds.undoLast() + " blocks restored).");
+                      return;
+                  }
+                  if (bot == null) {
+                      say(server, "I need my body for that. Type /ai spawn first.");
+                      return;
+                  }
+                  switch (cmd) {
+                      case "STOP":
+                          bot.stopJob();
+                          break;
+                      case "COME":
+                          bot.stopJob();
+                          if (bot.getWorld() == p.getServerWorld() && bot.squaredDistanceTo(p) > 36.0) {
+                              bot.refreshPositionAndAngles(p.getX() + 1.0, p.getY(), p.getZ() + 1.0, bot.getYaw(), bot.getPitch());
+                          }
+                          break;
+                      case "FIND":
+                          if (args.isEmpty()) {
+                              say(server, "Find what?");
+                              return;
+                          }
+                          callBot(bot, p);
+                          if (!bot.startFind(args)) say(server, "I don't know what \"" + args + "\" is.");
+                          break;
+                      case "BUILD": {
+                          String[] t = args.isEmpty() ? new String[0] : args.split("\\s+");
+                          if (t.length == 0) {
+                              say(server, "Build what? I can do: house, tower, wall, bridge, platform, pyramid.");
+                              return;
+                          }
+                          String shape = Builds.shapeName(t[0]);
+                          if (shape == null) {
+                              say(server, "I can only build: house, tower, wall, bridge, platform, pyramid.");
+                              return;
+                          }
+                          int size = 0;
+                          String mat = null;
+                          for (int i = 1; i < t.length; i++) {
+                              try {
+                                  size = Integer.parseInt(t[i]);
+                              } catch (NumberFormatException e) {
+                                  mat = mat == null ? t[i] : mat + "_" + t[i];
+                              }
+                          }
+                          Block def = Builds.defaultMaterial(shape);
+                          Block b = Builds.material(mat, def);
+                          if (b == null) {
+                              say(server, "I can't use that block, so I'll use " + def.getName().getString() + ".");
+                              b = def;
+                          }
+                          Direction d = p.getHorizontalFacing();
+                          List<Builds.Step> steps = Builds.generate(shape, b, size, p.getBlockPos(), d.getOffsetX(), d.getOffsetZ());
+                          if (steps.isEmpty()) {
+                              say(server, "I couldn't plan that build.");
+                              return;
+                          }
+                          callBot(bot, p);
+                          bot.startBuild(steps);
+                          break;
+                      }
+                      default:
+                          break;
+                  }
+              }
+
+              // ---------- AI ----------
+              static void ask(ServerPlayerEntity p, String text) {
+                  MinecraftServer server = p.getServer();
+                  if (server == null) return;
+                  if (config.apiKey == null || config.apiKey.isBlank()) {
+                      say(server, "I have no API key yet. An op must type: /ai key YOUR_KEY");
+                      return;
+                  }
+                  UUID id = p.getUuid();
+                  if (!busy.add(id)) {
+                      say(server, "Wait, I'm still thinking...");
+                      return;
+                  }
+
+                  ArrayList<String[]> h = history.computeIfAbsent(id, k -> new ArrayList<>());
+                  h.add(new String[]{"user", text});
+                  while (h.size() > 12) h.remove(0);
+
+                  AiBotEntity bot = findBot(p);
+                  String bodyInfo = bot == null
+                      ? " You have no body yet; if the player wants you to build or find things, tell them to type /ai spawn."
+                      : " Your body is at " + bot.getBlockPos().getX() + " " + bot.getBlockPos().getY() + " " + bot.getBlockPos().getZ()
+                          + (bot.isBuilding() ? " and you are busy building." : bot.isFinding() ? " and you are busy searching." : ".");
+                  String ctxInfo = " The player talking to you is " + p.getName().getString()
+                      + ", at " + p.getBlockPos().getX() + " " + p.getBlockPos().getY() + " " + p.getBlockPos().getZ()
+                      + " in " + p.getServerWorld().getRegistryKey().getValue()
+                      + ", health " + Math.round(p.getHealth()) + "/20." + bodyInfo;
+
+                  JsonArray msgs = new JsonArray();
+                  JsonObject sys = new JsonObject();
+                  sys.addProperty("role", "system");
+                  sys.addProperty("content", config.personality + ACTIONS + ctxInfo);
+                  msgs.add(sys);
+                  for (String[] m : h) {
+                      JsonObject o = new JsonObject();
+                      o.addProperty("role", m[0]);
+                      o.addProperty("content", m[1]);
+                      msgs.add(o);
+                  }
+                  JsonObject body = new JsonObject();
+                  body.addProperty("model", config.model);
+                  body.add("messages", msgs);
+                  body.addProperty("max_tokens", 800);
+
+                  HttpRequest req;
+                  try {
+                      req = HttpRequest.newBuilder(URI.create(config.apiUrl))
+                          .header("Content-Type", "application/json")
+                          .header("Authorization", "Bearer " + config.apiKey)
+                          .timeout(Duration.ofSeconds(40))
+                          .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+                          .build();
+                  } catch (RuntimeException e) {
+                      busy.remove(id);
+                      say(server, "The API url looks wrong. Use /ai url <link>");
+                      return;
+                  }
+
+                  HTTP.sendAsync(req, HttpResponse.BodyHandlers.ofString()).whenComplete((resp, err) -> {
+                      String[] r = result(resp, err);
+                      server.execute(() -> {
+                          busy.remove(id);
+                          if (r[0].equals("1")) {
+                              h.add(new String[]{"assistant", r[1]});
+                              while (h.size() > 12) h.remove(0);
+                              String shown = clean(r[1]);
+                              if (shown.isEmpty()) shown = "Okay!";
+                              say(server, shown);
+                              try {
+                                  act(p, server, r[1]);
+                              } catch (RuntimeException ex) {
+                                  say(server, "That action failed: " + ex.getClass().getSimpleName());
+                              }
+                          } else {
+                              say(server, r[1]);
+                          }
+                      });
+                  });
+              }
+
+              static String[] result(HttpResponse<String> resp, Throwable err) {
+                  if (err != null) {
+                      Throwable c = err.getCause() != null ? err.getCause() : err;
+                      return new String[]{"0", "Could not reach the AI: " + c.getClass().getSimpleName() + " " + c.getMessage()};
+                  }
+                  String b = resp.body();
+                  if (resp.statusCode() / 100 != 2) {
+                      String shortBody = b.length() > 200 ? b.substring(0, 200) : b;
+                      return new String[]{"0", "AI error " + resp.statusCode() + ": " + shortBody};
+                  }
+                  try {
+                      JsonObject o = JsonParser.parseString(b).getAsJsonObject();
+                      String text = o.getAsJsonArray("choices").get(0).getAsJsonObject()
+                          .getAsJsonObject("message").get("content").getAsString().trim();
+                      return new String[]{"1", text};
+                  } catch (RuntimeException e) {
+                      return new String[]{"0", "Could not read the AI answer."};
+                  }
+              }
+          }
+          EOF
